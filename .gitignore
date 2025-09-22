@@ -1,0 +1,5 @@
+venv
+embeddings.npy
+faiss_index.bin
+products_meta.pkl
+*.env

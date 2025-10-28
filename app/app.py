@@ -1,9 +1,15 @@
 import streamlit as st
-from faiss_utils import search_products
-from gpt_utils import generate_gpt_response
-from intention_utils import check_greetings, check_more_results
-from render_utils import render_chat_message, render_product_card, render_products
 from streamlit_mic_recorder import mic_recorder
+import tempfile
+import whisper
+
+from intention_utils import check_greetings, check_more_results
+from intent_classifier import classify_intent
+from intent_utils import INTENT_HANDLERS
+from render_utils import render_chat_message, render_product_card, render_products
+from voice_utils import render_voice
+from gtts import gTTS
+
 
 st.markdown(
     """
@@ -30,142 +36,111 @@ st.markdown(
         color: white;
         margin-right: auto;
     }
+    
+    /*To keep input fields at bottom */
+    .st-key-input_box {
+        position: fixed;
+        bottom: 3rem;
+        }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
+class ChatState:
+    def __init__(self):
+        self.history = []
+        self.last_query = None
+        self.last_products = []
+        self.offset = 0
+        self.k = 3
+        self.option = "All"
+        self.price_range = (0, 1000)
 
 
 def main():
-    st.set_page_config(page_title="KuraKani AI", layout = "wide")
+    st.set_page_config(page_title="KuraKani AI", layout="wide")
     st.title("KuraKani AI")
 
-    # Initialize session state
-    if "history" not in st.session_state:
-        st.session_state.history = []
-    if "last_query" not in st.session_state:
-        st.session_state.last_query = None
-    if "last_products" not in st.session_state:
-        st.session_state.last_products = []
-    if "offset" not in st.session_state:
-        st.session_state.offset = 0
+    # Session State
+    if "chat_state" not in st.session_state:
+        st.session_state.chat_state = ChatState()
+    state = st.session_state.chat_state
 
-    # sidebar 
+    # Whisper model
+    @st.cache_resource
+    def load_whisper_model():
+        return whisper.load_model("base")
+    
+    whisper_model = load_whisper_model()
+
+    # Sidebar
     st.sidebar.header("Search Settings")
-    k = st.sidebar.slider("Number of Results", 1, 10, 3)
-    price_range = st.sidebar.slider("Price range",0, 3000, (0,1000) )
+    state.k = st.sidebar.slider("Number of Results", 1, 10, 3)
+    price_range = st.sidebar.slider("Price range", 0, 3000, (0, 1000))
     with st.sidebar:
-        option = st.selectbox("Choose Category",("All","Keyboard","Mouse","Smart Phones","Camera"),index=0)
+        state.option = st.selectbox("Choose Category", ("All", "Keyboard", "Mouse", "Smart Phones", "Camera"), index=0)
 
-    # if st.session_state.last_products:
-    #     render_products(st.session_state.last_products)
-
-    audio = mic_recorder(
-    start_prompt="🎙",
-    stop_prompt="🎙",
-    just_once=False,
-    use_container_width=False,
-    format="webm",
-    callback=None,
-    args=(),
-    kwargs={},
-    key=None
-    )
-
-    # Display past messages
-    for message in st.session_state.history:
+    # Display chat history
+    for message in state.history:
         render_chat_message(message["role"], message["content"])
 
-    # user query:
-    query = st.chat_input("How can I help: ")
-    if query:
-        query = query.strip()
-        if not query:
-            st.error("Please enter a valid message.")
+    with st.container(key= "input_box"):
+        col1, col2 = st.columns([8, 1])
+        with col1:
+        # User input
+            query = st.chat_input("How can I help: ")
+        # Voice input
+        with col2:
+            audio = mic_recorder(
+            start_prompt="🎙",
+            stop_prompt="🛑",
+            format="wav",
+            key=None
+            )
+
+    if audio and "bytes" in audio:
+        # Save WAV bytes to a temp file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as temp_audio:
+            temp_audio.write(audio["bytes"])
+            temp_path = temp_audio.name
+        # Transcribe
+        result = whisper_model.transcribe(temp_path)
+        query_text = result["text"]
+        query = str(result.get("text", "")).strip()
+        # remove later
+        if query_text:
+            st.write("🎤 You said:", query_text)
+            
+    if not query:
+        return
+    query = query.strip()
+    if not query:
+        st.error("Please enter a valid message.")
+        return
+
+    # ---Save user query---
+    state.history.append({"role": "user", "content": query})
+    render_chat_message("user", query)
+
+    try:
+        intent, rewritten_query = classify_intent(query, context= state.last_query)
+        handler = INTENT_HANDLERS.get(intent)
+
+        if handler:
+            if intent == "product_search" or intent == "more_results":
+                reply = handler(rewritten_query or query, state, state.k, state.option, state.price_range)
+            else:
+                reply = handler(rewritten_query or query, state)    
         else:
-            #save the query 
-            st.session_state.history.append({"role": "user", "content": query})
-            render_chat_message("user", query)
+            reply = "Sorry, I didn't understand that."
 
-            try:
-                # check if user wants more results
-                if check_more_results(query) and st.session_state.last_query:
-                    new_products = search_products(
-                        st.session_state.last_query, 
-                        k=k,
-                        category=option,
-                        price_range=price_range,
-                        offset=st.session_state.offset
-                    )
-                    if new_products:
-                        st.session_state.last_products.extend(new_products)
-                        st.session_state.offset += len(new_products)
-                        bot_reply = f"Here are more products related to: {st.session_state.last_query}."
-                        render_products(new_products)
-                        with st.spinner("Thinking..."):
-                            answer = generate_gpt_response(
-                                st.session_state.last_query,
-                                new_products,
-                                followup=query
-                            )
-                        render_chat_message("assistant", answer)
-                        st.session_state.history.append({"role":"assistant","content":answer}) 
-                    else:
-                        bot_reply = "No more similar products."
-                        render_chat_message("assistant",bot_reply)
-                        st.session_state.history.append({"role":"assistant","content":bot_reply})
-                    return    
-
-                # check for greetings
-                intent, processed_query = check_greetings(query)
-                if intent == "greeting":
-                    bot_reply = "Hello, how can I help you today? "
-                    render_chat_message("assistant", bot_reply)
-                    st.session_state.history.append({"role": "assistant", "content": bot_reply})
-                    return
-                
-                elif intent == "query":
-                    # For followup
-                    if st.session_state.last_query and st.session_state.last_products:
-                        try:
-                            answer = generate_gpt_response(
-                                st.session_state.last_query,
-                                st.session_state.last_products,
-                                followup=query
-                            )
-                            render_chat_message("assistant",answer)
-                            st.session_state.history.append({"role": "assistant", "content": answer}) 
-                        except Exception as e:
-                            st.error("GPT error occured")
-
-                    #First query 
-                    else:
-                        products = search_products(processed_query, k=k, category= option, price_range= price_range)
-
-                        # check if products are found
-                        if not products:
-                            message = f"No good matches found for: {processed_query}"
-                            render_chat_message("assistant", message)
-                            st.session_state.history.append({"role": "assistant", "content": message})
-                        else:
-                            st.session_state.last_query = processed_query
-                            st.session_state.last_products = products
-
-                            # GPT response
-                            if products:
-                                with st.chat_message("assistant"):
-                                    # st.subheader("Search Results: ")
-                                    render_products(products)
-
-                                with st.spinner("Thinking"):
-                                    # st.subheader("Answer: ")
-                                    answer = generate_gpt_response(processed_query, products)
-                                    render_chat_message("assistant", answer)
-                         
-                                st.session_state.history.append({"role": "assistant", "content": answer})                 
-            except Exception as e:
-                st.error(f"Some error occured:{e} ")
+        #show bot response
+        render_chat_message("assistant", reply)
+        render_voice(reply)
+        state.history.append({"role": "assistant", "content": reply})
+    except Exception as e:
+        st.error(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
